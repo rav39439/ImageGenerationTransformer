@@ -1,0 +1,79 @@
+#-----------------------------------------vqvae_load-----------------------------
+
+"""Load the pretrained VQ-VAE components saved by ``vqvae_train.py``."""
+
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+
+# try:  # Support both ``python -m vit.train`` and running from vit/.
+#     from .vqvae import VectorQuantizer, get_decoder, get_encoder
+# except ImportError:
+#     from vqvae import VectorQuantizer, get_decoder, get_encoder
+
+
+# HERE = Path(__file__).resolve().parent
+# DEFAULT_MODEL_DIR = HERE / "models"
+
+DEFAULT_MODEL_DIR = Path("/kaggle/input/datasets/ravckumar/image-encoder-decoder-trained")
+# DEFAULT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+LATENT_DIM = 256
+NUM_EMBEDDINGS = 1024
+
+def load_vqvae(model_dir=DEFAULT_MODEL_DIR):
+    """Return (encoder, quantizer, decoder) with pretrained local weights."""
+    model_dir = Path(model_dir)
+    vq_path = model_dir / "vq_epoch.npy"
+    encoder_path = model_dir / "encoder_epoch.weights.h5"
+    decoder_path = model_dir / "decoder_epoch.weights.h5"
+    for path in (vq_path, encoder_path, decoder_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Required VQ-VAE weights not found: {path}")
+
+    encoder = get_encoder(latent_dim=LATENT_DIM)
+    decoder = get_decoder(latent_dim=LATENT_DIM)
+    quantizer = VectorQuantizer(
+        num_embeddings=NUM_EMBEDDINGS,
+        embedding_dim=LATENT_DIM,
+        name="vector_quantizer",
+    )
+    _ = encoder(tf.zeros((1, 224, 224, 3), dtype=tf.float32))
+    _ = decoder(tf.zeros((1, 56, 56, LATENT_DIM), dtype=tf.float32))
+    _ = quantizer(tf.zeros((1, 56, 56, LATENT_DIM), dtype=tf.float32))
+
+    encoder.load_weights(str(encoder_path))
+    decoder.load_weights(str(decoder_path))
+    # quantizer.set_weights(np.load(vq_path, allow_pickle=True).tolist())
+
+    vq_weights = np.load(vq_path, allow_pickle=True)
+    vq_weights = np.squeeze(vq_weights)
+    
+    # Ensure the expected shape
+    expected_shape = tuple(quantizer.get_weights()[0].shape)
+    
+    if vq_weights.shape != expected_shape:
+        raise ValueError(
+            f"Expected quantizer weights {expected_shape}, "
+            f"but received {vq_weights.shape}"
+        )
+    
+    quantizer.set_weights([vq_weights.astype(np.float32)])
+    
+    print("Quantizer weights loaded:", vq_weights.shape)
+
+    # These components provide a fixed pretrained image tokenizer/decoder.
+    encoder.trainable = False
+    quantizer.trainable = False
+    decoder.trainable = False
+    return encoder, quantizer, decoder
+
+
+if __name__ == "__main__":
+    enc, vq, dec = load_vqvae()
+    sample = tf.zeros((1, 224, 224, 3), dtype=tf.float32)
+    z = enc(sample)
+    zq, indices = vq(z, return_indices=True)
+    reconstruction = dec(zq)
+    print("Encoded:", z.shape, "tokens:", indices.shape, "decoded:", reconstruction.shape)
