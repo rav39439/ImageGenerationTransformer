@@ -1,0 +1,2404 @@
+
+
+import os
+import json
+import csv
+import math
+from pathlib import Path
+from collections import defaultdict
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tqdm.auto import tqdm
+
+# Import your actual VQ-VAE loader.
+# Change this import if your loader is in another module.
+# from vqvae_load import load_vqvae
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATASET_ROOT = (
+    "/kaggle/input/datasets/hsankesara/"
+    "flickr-image-dataset/flickr30k_images"
+)
+
+IMAGE_ROOT = os.path.join(
+    DATASET_ROOT,
+    "flickr30k_images"
+)
+
+CAPTION_FILE = os.path.join(
+    DATASET_ROOT,
+    "results.csv"
+)
+
+IMAGE_DIR = Path(IMAGE_ROOT)
+
+OUTPUT_DIR = Path(
+    "/kaggle/working/pixart_finetuned"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+IMAGE_SIZE = (224, 224)
+
+# VQ-VAE
+LATENT_CHANNELS = 256
+CODEBOOK_SIZE = 1024
+
+# Image token grid
+IMAGE_TOKENS_SIDE = 14
+IMAGE_TOKEN_COUNT = IMAGE_TOKENS_SIDE ** 2
+
+BOS_TOKEN = CODEBOOK_SIZE
+
+# Text
+MAX_TEXT_LENGTH = 64
+TEXT_VOCAB_LIMIT = 20000
+
+# Transformer
+EMBED_DIM = 256
+NUM_HEADS = 8
+NUM_LAYERS = 26
+TEXT_ENCODER_LAYERS = 4
+
+DFF = 1024
+DROPOUT = 0.1
+
+MAX_POSITION_ENCODING = 256
+
+# Training
+BATCH_SIZE = 4
+EPOCHS = 3
+
+INITIAL_LR = 2.5e-5
+MIN_LR = 9e-6
+
+TRAIN_RATIO = 0.90
+
+# IMPORTANT: First 15,000 unique image filenames.
+MAX_IMAGES = 14500
+
+AUTOTUNE = tf.data.AUTOTUNE
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp"
+}
+
+DECODER_LATENT_SIZE = 56
+
+tf.keras.utils.set_random_seed(42)
+
+
+# ============================================================
+# LOAD FIRST 15,000 UNIQUE IMAGES AND THEIR CAPTIONS
+# ============================================================
+
+def load_captions(caption_file):
+
+    if not os.path.isfile(caption_file):
+        raise FileNotFoundError(
+            f"Caption file not found: {caption_file}"
+        )
+
+    captions = {}
+
+    skipped_rows = 0
+    total_caption_rows = 0
+
+    with open(
+        caption_file,
+        "r",
+        encoding="utf-8-sig",
+        newline=""
+    ) as file:
+
+        sample = file.read(8192)
+        file.seek(0)
+
+        try:
+            dialect = csv.Sniffer().sniff(
+                sample,
+                delimiters=",|\t;"
+            )
+        except csv.Error:
+            dialect = csv.excel
+
+        reader = csv.DictReader(
+            file,
+            dialect=dialect
+        )
+
+        if not reader.fieldnames:
+            raise ValueError(
+                "Invalid caption CSV."
+            )
+
+        field_map = {
+            name.strip().lower(): name
+            for name in reader.fieldnames
+            if name
+        }
+
+        image_column = None
+        caption_column = None
+
+        for key, original in field_map.items():
+
+            if key in {
+                "image",
+                "image_name",
+                "filename",
+                "file_name"
+            }:
+                image_column = original
+
+            if key in {
+                "caption",
+                "comment",
+                "description",
+                "text"
+            }:
+                caption_column = original
+
+        if image_column is None:
+            image_column = reader.fieldnames[0]
+
+        if caption_column is None:
+            caption_column = reader.fieldnames[-1]
+
+        if image_column == caption_column:
+            raise ValueError(
+                f"Invalid CSV columns: {reader.fieldnames}"
+            )
+
+        # Preserve original CSV ordering.
+        for row in reader:
+
+            image_name = row.get(image_column)
+            caption = row.get(caption_column)
+
+            if not image_name or not caption:
+                skipped_rows += 1
+                continue
+
+            image_name = os.path.basename(
+                image_name.strip()
+            )
+
+            caption = caption.strip()
+
+            if not image_name or not caption:
+                skipped_rows += 1
+                continue
+
+            # Only select the first 15,000 unique images.
+            if image_name not in captions:
+
+                if len(captions) >= MAX_IMAGES:
+                    continue
+
+                captions[image_name] = []
+
+            # Keep every caption for selected images.
+            captions[image_name].append(caption)
+
+            total_caption_rows += 1
+
+    if not captions:
+        raise ValueError(
+            "No valid image-caption records found."
+        )
+
+    print("\n========== CAPTION SUMMARY ==========")
+
+    print(
+        "Unique images selected:",
+        len(captions)
+    )
+
+    print(
+        "Total captions loaded:",
+        total_caption_rows
+    )
+
+    print(
+        "Skipped CSV rows:",
+        skipped_rows
+    )
+
+    print(
+        "Average captions per image:",
+        round(
+            total_caption_rows / len(captions),
+            2
+        )
+    )
+
+    if total_caption_rows > len(captions):
+        print(
+            "Multiple captions per image detected."
+        )
+
+    if len(captions) < MAX_IMAGES:
+        print(
+            "WARNING: Fewer than 15,000 unique images "
+            "were found in the CSV."
+        )
+
+    print("=====================================\n")
+
+    return captions
+
+
+# ============================================================
+# LOAD IMAGES IN EXACT CSV ORDER
+# ============================================================
+
+# def load_image_paths(caption_map):
+
+#     print("Loading images in caption order...")
+
+#     paths = []
+#     missing_images = []
+#     unsupported_images = []
+
+#     for image_name in caption_map:
+
+#         image_path = IMAGE_DIR / image_name
+
+#         if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+#             unsupported_images.append(image_name)
+#             continue
+
+#         if not image_path.is_file():
+#             missing_images.append(image_name)
+#             continue
+
+#         paths.append(str(image_path))
+
+#     print("\n========== IMAGE SUMMARY ==========")
+
+#     print(
+#         "Images requested:",
+#         len(caption_map)
+#     )
+
+#     print(
+#         "Images successfully loaded:",
+#         len(paths)
+#     )
+
+#     print(
+#         "Missing images:",
+#         len(missing_images)
+#     )
+
+#     print(
+#         "Unsupported images:",
+#         len(unsupported_images)
+#     )
+
+#     print("===================================\n")
+
+#     if missing_images:
+
+#         print("First 20 missing images:")
+
+#         for name in missing_images[:20]:
+#             print(name)
+
+#     if unsupported_images:
+
+#         print("First 20 unsupported images:")
+
+#         for name in unsupported_images[:20]:
+#             print(name)
+
+#     if not paths:
+#         raise ValueError(
+#             "No matching image files found."
+#         )
+
+#     return paths
+
+
+def load_image_paths(caption_map):
+
+    print("Loading images in caption order...")
+
+    paths = []
+    missing_images = []
+    unsupported_images = []
+
+    for image_name in tqdm(
+        caption_map,
+        total=len(caption_map),
+        desc="Loading image files",
+        unit="image",
+        dynamic_ncols=True
+    ):
+
+        image_path = IMAGE_DIR / image_name
+
+        if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            unsupported_images.append(image_name)
+            continue
+
+        if not image_path.is_file():
+            missing_images.append(image_name)
+            continue
+
+        paths.append(str(image_path))
+
+    print("\n========== IMAGE SUMMARY ==========")
+
+    print("Images requested:", len(caption_map))
+    print("Images successfully loaded:", len(paths))
+    print("Missing images:", len(missing_images))
+    print("Unsupported images:", len(unsupported_images))
+
+    print("===================================\n")
+
+    if missing_images:
+        print("First 20 missing images:")
+        for name in missing_images[:20]:
+            print(name)
+
+    if unsupported_images:
+        print("First 20 unsupported images:")
+        for name in unsupported_images[:20]:
+            print(name)
+
+    if not paths:
+        raise ValueError("No matching image files found.")
+
+    return paths
+
+
+# ============================================================
+# VERIFY IMAGE-CAPTION MAPPING
+# ============================================================
+
+def verify_image_caption_mapping(
+    image_paths,
+    captions
+):
+
+    image_names = [
+        os.path.basename(path)
+        for path in image_paths
+    ]
+
+    image_name_set = set(image_names)
+
+    missing_caption_names = [
+        name
+        for name in image_names
+        if name not in captions
+    ]
+
+    caption_without_image = [
+        name
+        for name in captions
+        if name not in image_name_set
+    ]
+
+    total_captions = sum(
+        len(captions[name])
+        for name in image_names
+        if name in captions
+    )
+
+    multiple_caption_images = sum(
+        len(captions[name]) > 1
+        for name in image_names
+        if name in captions
+    )
+
+    print("\n========== DATASET VERIFICATION ==========")
+
+    print("Unique images:", len(image_names))
+
+    print("Total captions:", total_captions)
+
+    print(
+        "Images without captions:",
+        len(missing_caption_names)
+    )
+
+    print(
+        "Caption filenames without images:",
+        len(caption_without_image)
+    )
+
+    print(
+        "Images with multiple captions:",
+        multiple_caption_images
+    )
+
+    print("==========================================\n")
+
+    if missing_caption_names:
+        raise ValueError(
+            "Some loaded images have no captions."
+        )
+
+    if len(image_names) > MAX_IMAGES:
+        raise ValueError(
+            "Loaded more than MAX_IMAGES."
+        )
+
+    return total_captions
+
+
+# ============================================================
+# TRAIN / VALIDATION SPLIT
+# ============================================================
+
+def split_image_paths(paths):
+
+    split_index = int(
+        len(paths) * TRAIN_RATIO
+    )
+
+    train_paths = paths[:split_index]
+
+    val_paths = paths[split_index:]
+
+    print("Training images:", len(train_paths))
+
+    print("Validation images:", len(val_paths))
+
+    return train_paths, val_paths
+
+
+# ============================================================
+# LOAD AND PREPROCESS IMAGES
+# ============================================================
+
+def load_image(path):
+
+    image_bytes = tf.io.read_file(path)
+
+    image = tf.io.decode_image(
+        image_bytes,
+        channels=3,
+        expand_animations=False
+    )
+
+    image.set_shape([None, None, 3])
+
+    image = tf.image.resize(
+        image,
+        IMAGE_SIZE
+    )
+
+    image = tf.cast(
+        image,
+        tf.float32
+    ) / 255.0
+
+    return image
+
+
+# ============================================================
+# GET VQ-VAE CODEBOOK EMBEDDINGS
+# ============================================================
+
+def get_codebook_embeddings(quantizer):
+
+    embeddings = getattr(
+        quantizer,
+        "embeddings",
+        None
+    )
+
+    if embeddings is None:
+
+        embedding_layer = getattr(
+            quantizer,
+            "embedding",
+            None
+        )
+
+        if embedding_layer is not None:
+
+            embeddings = getattr(
+                embedding_layer,
+                "embeddings",
+                None
+            )
+
+    if embeddings is None:
+        raise AttributeError(
+            "Cannot find VQ-VAE codebook embeddings."
+        )
+
+    embeddings = tf.convert_to_tensor(
+        embeddings,
+        dtype=tf.float32
+    )
+
+    tf.debugging.assert_equal(
+        tf.shape(embeddings)[0],
+        CODEBOOK_SIZE
+    )
+
+    tf.debugging.assert_equal(
+        tf.shape(embeddings)[1],
+        LATENT_CHANNELS
+    )
+
+    return embeddings
+
+
+# ============================================================
+# CONVERT ENCODER FEATURES TO IMAGE TOKENS
+# ============================================================
+
+def encode_to_image_tokens(
+    images,
+    encoder,
+    codebook_embeddings
+):
+
+    latent = encoder(
+        images,
+        training=False
+    )
+
+    if isinstance(latent, (tuple, list)):
+        latent = latent[0]
+
+    tf.debugging.assert_equal(
+        tf.shape(latent)[-1],
+        LATENT_CHANNELS,
+        message="Encoder and codebook dimensions mismatch."
+    )
+
+    latent = tf.image.resize(
+        latent,
+        [
+            IMAGE_TOKENS_SIDE,
+            IMAGE_TOKENS_SIDE
+        ],
+        method="area"
+    )
+
+    batch_size = tf.shape(latent)[0]
+
+    flat_latent = tf.reshape(
+        latent,
+        [-1, LATENT_CHANNELS]
+    )
+
+    latent_squared = tf.reduce_sum(
+        tf.square(flat_latent),
+        axis=1,
+        keepdims=True
+    )
+
+    embedding_squared = tf.reduce_sum(
+        tf.square(codebook_embeddings),
+        axis=1
+    )
+
+    distances = (
+        latent_squared
+        + embedding_squared[tf.newaxis, :]
+        - 2.0 * tf.matmul(
+            flat_latent,
+            codebook_embeddings,
+            transpose_b=True
+        )
+    )
+
+    indices = tf.argmin(
+        distances,
+        axis=1,
+        output_type=tf.int32
+    )
+
+    indices = tf.reshape(
+        indices,
+        [
+            batch_size,
+            IMAGE_TOKEN_COUNT
+        ]
+    )
+
+    return indices
+
+
+# ============================================================
+# PRECOMPUTE IMAGE TOKENS
+# ============================================================
+
+def precompute_image_tokens(
+    image_paths,
+    encoder,
+    codebook_embeddings
+):
+
+    token_map = {}
+
+    total_batches = math.ceil(
+        len(image_paths) / BATCH_SIZE
+    )
+
+    for batch_number in tqdm(
+        range(total_batches),
+        desc="Encoding images into VQ tokens"
+    ):
+
+        start = batch_number * BATCH_SIZE
+
+        end = min(
+            start + BATCH_SIZE,
+            len(image_paths)
+        )
+
+        batch_paths = image_paths[start:end]
+
+        images = tf.stack([
+            load_image(path)
+            for path in batch_paths
+        ])
+
+        tokens = encode_to_image_tokens(
+            images,
+            encoder,
+            codebook_embeddings
+        )
+
+        tokens = tokens.numpy()
+
+        for path, image_tokens in zip(
+            batch_paths,
+            tokens
+        ):
+
+            token_map[os.path.basename(path)] = (
+                image_tokens.astype(np.int32)
+            )
+
+    print(
+        "Precomputed image token sequences:",
+        len(token_map)
+    )
+
+    return token_map
+
+
+# ============================================================
+# CREATE IMAGE-CAPTION PAIRS
+# ============================================================
+
+def create_caption_pairs(
+    image_paths,
+    captions,
+    token_map
+):
+
+    pairs = []
+
+    for image_path in image_paths:
+
+        image_name = os.path.basename(
+            image_path
+        )
+
+        if image_name not in token_map:
+            continue
+
+        for caption in captions.get(image_name, []):
+
+            pairs.append((
+                caption,
+                token_map[image_name]
+            ))
+
+    if not pairs:
+        raise ValueError(
+            "No caption-image token pairs were created."
+        )
+
+    print(
+        "Total image-caption pairs:",
+        len(pairs)
+    )
+
+    return pairs
+
+
+# ============================================================
+# CREATE TEXT VECTORIZER
+# ============================================================
+
+def create_text_vectorizer(train_pairs):
+
+    train_captions = [
+        caption
+        for caption, _ in train_pairs
+    ]
+
+    vectorizer = layers.TextVectorization(
+        max_tokens=TEXT_VOCAB_LIMIT,
+        standardize="lower_and_strip_punctuation",
+        split="whitespace",
+        output_mode="int",
+        output_sequence_length=MAX_TEXT_LENGTH
+    )
+
+    vectorizer.adapt(
+        tf.data.Dataset.from_tensor_slices(
+            train_captions
+        ).batch(1024)
+    )
+
+    vocabulary = vectorizer.get_vocabulary()
+
+    print(
+        "Text vocabulary size:",
+        len(vocabulary)
+    )
+
+    return vectorizer
+
+
+# ============================================================
+# CREATE NEXT-TOKEN TRAINING PAIRS
+# ============================================================
+
+def prepare_transformer_inputs(image_tokens):
+
+    batch_size = tf.shape(image_tokens)[0]
+
+    bos = tf.fill(
+        [batch_size, 1],
+        tf.cast(BOS_TOKEN, tf.int32)
+    )
+
+    sequences = tf.concat(
+        [bos, image_tokens],
+        axis=1
+    )
+
+    inputs = sequences[:, :-1]
+
+    targets = sequences[:, 1:]
+
+    return inputs, targets
+
+
+# ============================================================
+# BUILD TEXT-IMAGE DATASET
+# NO SHUFFLING
+# ============================================================
+
+def build_dataset(
+    pairs,
+    vectorizer,
+    training=True
+):
+
+    if not pairs:
+        raise ValueError(
+            "Cannot build an empty dataset."
+        )
+
+    captions = [
+        caption
+        for caption, _ in pairs
+    ]
+
+    image_tokens = np.stack([
+        tokens
+        for _, tokens in pairs
+    ]).astype(np.int32)
+
+    ds = tf.data.Dataset.from_tensor_slices(
+        (
+            captions,
+            image_tokens
+        )
+    )
+
+    # IMPORTANT:
+    # No ds.shuffle() here.
+    # Original caption-image order is preserved.
+
+    def convert_pair(caption, tokens):
+
+        text_ids = vectorizer(caption)
+
+        image_inputs, targets = (
+            prepare_transformer_inputs(
+                tokens[tf.newaxis, :]
+            )
+        )
+
+        image_inputs = image_inputs[0]
+
+        targets = targets[0]
+
+        inputs = {
+            "text_ids": text_ids,
+            "image_tokens": image_inputs
+        }
+
+        return inputs, targets
+
+    ds = ds.map(
+        convert_pair,
+        num_parallel_calls=AUTOTUNE,
+        deterministic=True
+    )
+
+    ds = ds.batch(
+        BATCH_SIZE,
+        drop_remainder=False
+    )
+
+    return ds.prefetch(AUTOTUNE)
+
+
+# ============================================================
+# TEXT ENCODER BLOCK
+# ============================================================
+
+class TextEncoderBlock(layers.Layer):
+
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        dff,
+        dropout=0.1
+    ):
+
+        super().__init__()
+
+        self.attention = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=dropout
+        )
+
+        self.ffn = keras.Sequential([
+            layers.Dense(
+                dff,
+                activation="gelu"
+            ),
+            layers.Dense(d_model)
+        ])
+
+        self.norm1 = layers.LayerNormalization(
+            epsilon=1e-6
+        )
+
+        self.norm2 = layers.LayerNormalization(
+            epsilon=1e-6
+        )
+
+        self.dropout1 = layers.Dropout(dropout)
+
+        self.dropout2 = layers.Dropout(dropout)
+
+    def call(
+        self,
+        x,
+        padding_mask,
+        training=False
+    ):
+
+        attention_mask = (
+            padding_mask[:, tf.newaxis, :]
+        )
+
+        attention_output = self.attention(
+            query=x,
+            key=x,
+            value=x,
+            attention_mask=attention_mask,
+            training=training
+        )
+
+        x = self.norm1(
+            x + self.dropout1(
+                attention_output,
+                training=training
+            )
+        )
+
+        ffn_output = self.ffn(
+            x,
+            training=training
+        )
+
+        x = self.norm2(
+            x + self.dropout2(
+                ffn_output,
+                training=training
+            )
+        )
+
+        return x
+
+
+# ============================================================
+# IMAGE DECODER BLOCK
+# ============================================================
+
+class ImageDecoderBlock(layers.Layer):
+
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        dff,
+        dropout=0.1
+    ):
+
+        super().__init__()
+
+        self.self_attention = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=dropout
+        )
+
+        self.cross_attention = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=dropout
+        )
+
+        self.ffn = keras.Sequential([
+            layers.Dense(
+                dff,
+                activation="gelu"
+            ),
+            layers.Dense(d_model)
+        ])
+
+        self.norm1 = layers.LayerNormalization(
+            epsilon=1e-6
+        )
+
+        self.norm2 = layers.LayerNormalization(
+            epsilon=1e-6
+        )
+
+        self.norm3 = layers.LayerNormalization(
+            epsilon=1e-6
+        )
+
+        self.dropout1 = layers.Dropout(dropout)
+
+        self.dropout2 = layers.Dropout(dropout)
+
+        self.dropout3 = layers.Dropout(dropout)
+
+    def call(
+        self,
+        image_x,
+        text_memory,
+        text_padding_mask,
+        training=False
+    ):
+
+        # Causal self-attention
+
+        attention_output = self.self_attention(
+            query=image_x,
+            key=image_x,
+            value=image_x,
+            use_causal_mask=True,
+            training=training
+        )
+
+        image_x = self.norm1(
+            image_x + self.dropout1(
+                attention_output,
+                training=training
+            )
+        )
+
+        # Cross-attention
+
+        cross_attention_mask = (
+            text_padding_mask[:, tf.newaxis, :]
+        )
+
+        cross_output = self.cross_attention(
+            query=image_x,
+            key=text_memory,
+            value=text_memory,
+            attention_mask=cross_attention_mask,
+            training=training
+        )
+
+        image_x = self.norm2(
+            image_x + self.dropout2(
+                cross_output,
+                training=training
+            )
+        )
+
+        # Feed-forward
+
+        ffn_output = self.ffn(
+            image_x,
+            training=training
+        )
+
+        image_x = self.norm3(
+            image_x + self.dropout3(
+                ffn_output,
+                training=training
+            )
+        )
+
+        return image_x
+
+
+# ============================================================
+# TEXT-TO-IMAGE TRANSFORMER
+# ============================================================
+
+class TextToImageTransformer(keras.Model):
+
+    def __init__(
+        self,
+        text_vocab_size,
+        image_vocab_size=1025,
+        d_model=256,
+        num_heads=8,
+        num_layers=26,
+        text_encoder_layers=4,
+        dff=1024,
+        max_text_length=64,
+        max_image_length=196,
+        dropout=0.1
+    ):
+
+        super().__init__()
+
+        self.d_model = d_model
+
+        self.image_vocab_size = image_vocab_size
+
+        # Text embeddings
+
+        self.text_embedding = layers.Embedding(
+            input_dim=text_vocab_size,
+            output_dim=d_model,
+            mask_zero=False
+        )
+
+        self.text_position_embedding = layers.Embedding(
+            input_dim=max_text_length,
+            output_dim=d_model
+        )
+
+        self.text_encoder_blocks = [
+            TextEncoderBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                dff=dff,
+                dropout=dropout
+            )
+            for _ in range(text_encoder_layers)
+        ]
+
+        self.text_dropout = layers.Dropout(dropout)
+
+        # Image embeddings
+
+        self.image_embedding = layers.Embedding(
+            input_dim=image_vocab_size,
+            output_dim=d_model
+        )
+
+        self.image_position_embedding = layers.Embedding(
+            input_dim=max_image_length,
+            output_dim=d_model
+        )
+
+        self.image_decoder_blocks = [
+            ImageDecoderBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                dff=dff,
+                dropout=dropout
+            )
+            for _ in range(num_layers)
+        ]
+
+        self.image_dropout = layers.Dropout(dropout)
+
+        self.output_layer = layers.Dense(
+            image_vocab_size
+        )
+
+    def call(
+        self,
+        inputs,
+        training=False
+    ):
+
+        text_ids = inputs["text_ids"]
+
+        image_tokens = inputs["image_tokens"]
+
+        text_length = tf.shape(text_ids)[1]
+
+        image_length = tf.shape(image_tokens)[1]
+
+        # Text encoding
+
+        text_positions = tf.range(
+            text_length
+        )[tf.newaxis, :]
+
+        text_padding_mask = tf.not_equal(
+            text_ids,
+            0
+        )
+
+        text_x = self.text_embedding(
+            text_ids
+        )
+
+        text_x *= tf.math.sqrt(
+            tf.cast(
+                self.d_model,
+                tf.float32
+            )
+        )
+
+        text_x += self.text_position_embedding(
+            text_positions
+        )
+
+        text_x = self.text_dropout(
+            text_x,
+            training=training
+        )
+
+        for block in self.text_encoder_blocks:
+
+            text_x = block(
+                text_x,
+                text_padding_mask,
+                training=training
+            )
+
+        # Image token embeddings
+
+        image_positions = tf.range(
+            image_length
+        )[tf.newaxis, :]
+
+        image_x = self.image_embedding(
+            image_tokens
+        )
+
+        image_x *= tf.math.sqrt(
+            tf.cast(
+                self.d_model,
+                tf.float32
+            )
+        )
+
+        image_x += self.image_position_embedding(
+            image_positions
+        )
+
+        image_x = self.image_dropout(
+            image_x,
+            training=training
+        )
+
+        # Caption-conditioned decoding
+
+        for block in self.image_decoder_blocks:
+
+            image_x = block(
+                image_x=image_x,
+                text_memory=text_x,
+                text_padding_mask=text_padding_mask,
+                training=training
+            )
+
+        logits = self.output_layer(
+            image_x
+        )
+
+        return logits
+
+
+# ============================================================
+# CREATE TRANSFORMER
+# ============================================================
+
+def create_transformer(text_vocab_size):
+
+    model = TextToImageTransformer(
+
+        text_vocab_size=text_vocab_size,
+
+        image_vocab_size=CODEBOOK_SIZE + 1,
+
+        d_model=EMBED_DIM,
+
+        num_heads=NUM_HEADS,
+
+        num_layers=NUM_LAYERS,
+
+        text_encoder_layers=TEXT_ENCODER_LAYERS,
+
+        dff=DFF,
+
+        max_text_length=MAX_TEXT_LENGTH,
+
+        max_image_length=MAX_POSITION_ENCODING,
+
+        dropout=DROPOUT
+    )
+
+    dummy_inputs = {
+
+        "text_ids": tf.ones(
+            [1, MAX_TEXT_LENGTH],
+            dtype=tf.int32
+        ),
+
+        "image_tokens": tf.zeros(
+            [1, IMAGE_TOKEN_COUNT],
+            dtype=tf.int32
+        )
+    }
+
+    dummy_logits = model(
+        dummy_inputs,
+        training=False
+    )
+
+    tf.debugging.assert_equal(
+        tf.shape(dummy_logits)[1],
+        IMAGE_TOKEN_COUNT
+    )
+
+    tf.debugging.assert_equal(
+        tf.shape(dummy_logits)[2],
+        CODEBOOK_SIZE + 1
+    )
+
+    print(
+        "Transformer output shape:",
+        dummy_logits.shape
+    )
+
+    return model
+
+
+# ============================================================
+# OPTIMIZER
+# ============================================================
+
+def create_optimizer(total_steps):
+
+    learning_rate = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=INITIAL_LR,
+        decay_steps=total_steps,
+        alpha=MIN_LR / INITIAL_LR
+    )
+
+    return keras.optimizers.Adam(
+        learning_rate=learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-7
+    )
+
+
+# ============================================================
+# COMPILE TRANSFORMER
+# ============================================================
+
+def compile_transformer(
+    model,
+    total_steps
+):
+
+    model.compile(
+
+        optimizer=create_optimizer(
+            total_steps
+        ),
+
+        loss=keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True
+        ),
+
+        metrics=[
+            keras.metrics.SparseCategoricalAccuracy(
+                name="accuracy"
+            )
+        ]
+    )
+
+    return model
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+def create_callbacks():
+
+    checkpoint_path = (
+        OUTPUT_DIR /
+        "text_to_image_transformer.weights.h5"
+    )
+
+    checkpoint_callback = keras.callbacks.ModelCheckpoint(
+
+        filepath=str(checkpoint_path),
+
+        save_weights_only=True,
+
+        save_best_only=False,
+
+        save_freq="epoch",
+
+        verbose=1
+    )
+
+    return [
+        checkpoint_callback,
+        keras.callbacks.TerminateOnNaN()
+    ]
+
+
+# ============================================================
+# PRINT MODEL INFORMATION
+# ============================================================
+
+def print_model_information(
+    model,
+    encoder,
+    quantizer,
+    decoder
+):
+
+    trainable_parameters = sum(
+        int(tf.size(v).numpy())
+        for v in model.trainable_variables
+    )
+
+    total_parameters = sum(
+        int(tf.size(v).numpy())
+        for v in model.variables
+    )
+
+    print("\n" + "=" * 65)
+
+    print("TEXT-TO-IMAGE TRANSFORMER")
+
+    print("=" * 65)
+
+    print("Text encoder layers:", TEXT_ENCODER_LAYERS)
+
+    print("Image decoder layers:", NUM_LAYERS)
+
+    print("Embedding dimension:", EMBED_DIM)
+
+    print("Attention heads:", NUM_HEADS)
+
+    print("Feed-forward dimension:", DFF)
+
+    print("\nText configuration:")
+
+    print("Maximum text length:", MAX_TEXT_LENGTH)
+
+    print("\nImage configuration:")
+
+    print("Image size:", IMAGE_SIZE)
+
+    print("Codebook size:", CODEBOOK_SIZE)
+
+    print("Image tokens:", IMAGE_TOKEN_COUNT)
+
+    print("Latent channels:", LATENT_CHANNELS)
+
+    print("\nParameters:")
+
+    print("Total:", total_parameters)
+
+    print("Trainable:", trainable_parameters)
+
+    print("\nVQ-VAE:")
+
+    print("Encoder frozen:", not encoder.trainable)
+
+    print("Quantizer frozen:", not quantizer.trainable)
+
+    print("Decoder frozen:", not decoder.trainable)
+
+    print("=" * 65)
+
+
+# ============================================================
+# SAVE CONFIGURATION AND TEXT VOCABULARY
+# ============================================================
+
+def save_configuration(vectorizer):
+
+    vocabulary = vectorizer.get_vocabulary()
+
+    vocabulary_path = (
+        OUTPUT_DIR / "text_vocabulary.json"
+    )
+
+    vocabulary_path.write_text(
+        json.dumps(
+            vocabulary,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
+    config = {
+
+        "model_type": "text_to_image",
+
+        "codebook_size": CODEBOOK_SIZE,
+
+        "latent_channels": LATENT_CHANNELS,
+
+        "image_tokens_side": IMAGE_TOKENS_SIDE,
+
+        "image_token_count": IMAGE_TOKEN_COUNT,
+
+        "bos_token": BOS_TOKEN,
+
+        "text_vocab_size": len(vocabulary),
+
+        "text_vocabulary_file": "text_vocabulary.json",
+
+        "max_text_length": MAX_TEXT_LENGTH,
+
+        "num_layers": NUM_LAYERS,
+
+        "text_encoder_layers": TEXT_ENCODER_LAYERS,
+
+        "d_model": EMBED_DIM,
+
+        "num_heads": NUM_HEADS,
+
+        "dff": DFF,
+
+        "dropout": DROPOUT,
+
+        "maximum_position_encoding": MAX_POSITION_ENCODING,
+
+        "batch_size": BATCH_SIZE,
+
+        "epochs": EPOCHS,
+
+        "image_size": list(IMAGE_SIZE),
+
+        "decoder_latent_size": DECODER_LATENT_SIZE,
+
+        "max_images": MAX_IMAGES,
+
+        "dataset_order": "original_csv_order",
+
+        "dataset_shuffling": False
+    }
+
+    config_path = (
+        OUTPUT_DIR /
+        "image_transformer_config.json"
+    )
+
+    config_path.write_text(
+        json.dumps(
+            config,
+            indent=4
+        ),
+        encoding="utf-8"
+    )
+
+    print("Saved configuration:", config_path)
+
+    print("Saved text vocabulary:", vocabulary_path)
+
+
+# ============================================================
+# DECODE IMAGE TOKENS
+# ============================================================
+
+def decode_image_tokens(
+    image_indices,
+    codebook_embeddings,
+    decoder
+):
+
+    number_of_images = tf.shape(
+        image_indices
+    )[0]
+
+    quantized = tf.gather(
+        codebook_embeddings,
+        image_indices
+    )
+
+    quantized = tf.reshape(
+        quantized,
+        [
+            number_of_images,
+            IMAGE_TOKENS_SIDE,
+            IMAGE_TOKENS_SIDE,
+            LATENT_CHANNELS
+        ]
+    )
+
+    # Nearest-neighbor preserves codebook vectors.
+    quantized = tf.image.resize(
+        quantized,
+        [
+            DECODER_LATENT_SIZE,
+            DECODER_LATENT_SIZE
+        ],
+        method="nearest"
+    )
+
+    images = decoder(
+        quantized,
+        training=False
+    )
+
+    images = tf.cond(
+        tf.reduce_min(images) < 0.0,
+        lambda: (images + 1.0) / 2.0,
+        lambda: images
+    )
+
+    return tf.clip_by_value(
+        images,
+        0.0,
+        1.0
+    )
+
+
+# ============================================================
+# GENERATE IMAGES FROM TEXT
+# ============================================================
+
+def generate_images(
+    transformer,
+    vectorizer,
+    codebook_embeddings,
+    decoder,
+    prompt,
+    number_of_images=4,
+    temperature=1.0,
+    top_k=50
+):
+
+    if temperature <= 0:
+        raise ValueError(
+            "Temperature must be greater than zero."
+        )
+
+    if not 1 <= top_k <= CODEBOOK_SIZE:
+        raise ValueError(
+            "top_k must be between 1 and CODEBOOK_SIZE."
+        )
+
+    print("\nText prompt:", prompt)
+
+    # Text prompt to token IDs
+
+    text_ids = vectorizer(
+        tf.constant([prompt])
+    )
+
+    text_ids = tf.repeat(
+        text_ids,
+        repeats=number_of_images,
+        axis=0
+    )
+
+    # Start with BOS
+
+    generated = tf.fill(
+        [number_of_images, 1],
+        tf.cast(BOS_TOKEN, tf.int32)
+    )
+
+    # Autoregressive image-token generation
+
+    for step in range(IMAGE_TOKEN_COUNT):
+
+        model_inputs = {
+
+            "text_ids": text_ids,
+
+            "image_tokens": generated
+        }
+
+        logits = transformer(
+            model_inputs,
+            training=False
+        )
+
+        next_logits = logits[:, -1, :CODEBOOK_SIZE]
+
+        next_logits = next_logits / temperature
+
+        top_values, top_indices = tf.math.top_k(
+            next_logits,
+            k=top_k
+        )
+
+        sampled_position = tf.random.categorical(
+            top_values,
+            num_samples=1
+        )
+
+        sampled_position = tf.cast(
+            sampled_position,
+            tf.int32
+        )
+
+        next_token = tf.gather(
+            top_indices,
+            sampled_position,
+            batch_dims=1
+        )
+
+        generated = tf.concat(
+            [
+                generated,
+                next_token
+            ],
+            axis=1
+        )
+
+        if (step + 1) % 25 == 0:
+
+            print(
+                f"Generated tokens: "
+                f"{step + 1}/{IMAGE_TOKEN_COUNT}"
+            )
+
+    image_indices = generated[:, 1:]
+
+    images = decode_image_tokens(
+        image_indices,
+        codebook_embeddings,
+        decoder
+    )
+
+    generation_dir = (
+        OUTPUT_DIR / "generated_images"
+    )
+
+    generation_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    for i in range(number_of_images):
+
+        path = (
+            generation_dir /
+            f"generated_{i + 1}.png"
+        )
+
+        keras.utils.save_img(
+            str(path),
+            images[i]
+        )
+
+        print("Saved:", path)
+
+    return images
+
+
+# ============================================================
+# MAIN TRAINING FUNCTION
+# ============================================================
+
+def main():
+
+
+    # --------------------------------------------------------
+    # 0. Initialize multi-GPU strategy
+    # --------------------------------------------------------
+
+    gpus = tf.config.list_physical_devices("GPU")
+
+    print("\nAvailable GPUs:", len(gpus))
+
+    if len(gpus) < 2:
+        raise RuntimeError(
+            f"Expected 2 GPUs, but found {len(gpus)}."
+        )
+    strategy = tf.distribute.MirroredStrategy(
+        devices=["/GPU:0", "/GPU:1"]
+    )
+
+    print("Number of synchronized replicas:", strategy.num_replicas_in_sync)
+
+    # Continue with your existing code...
+
+    # --------------------------------------------------------
+    # 1. Load first 15,000 unique images and captions
+    # --------------------------------------------------------
+
+    print("\nLoading Flickr30k captions...")
+
+    captions = load_captions(
+        CAPTION_FILE
+    )
+
+    # --------------------------------------------------------
+    # 2. Load images in original CSV order
+    # --------------------------------------------------------
+
+    print("\nLoading image paths...")
+
+    paths = load_image_paths(
+        captions
+    )
+
+    # --------------------------------------------------------
+    # 3. Verify mapping
+    # --------------------------------------------------------
+
+    total_captions = verify_image_caption_mapping(
+        paths,
+        captions
+    )
+
+    # --------------------------------------------------------
+    # 4. Split without shuffling
+    # --------------------------------------------------------
+
+    train_paths, val_paths = split_image_paths(
+        paths
+    )
+
+    print("\nFinal dataset statistics:")
+
+    print("Total images:", len(paths))
+
+    print("Total captions:", total_captions)
+
+    print("Training images:", len(train_paths))
+
+    print("Validation images:", len(val_paths))
+
+    # --------------------------------------------------------
+    # 5. Load pretrained VQ-VAE
+    # --------------------------------------------------------
+
+    print("\nLoading pretrained VQ-VAE...")
+
+    encoder, quantizer, decoder = load_vqvae()
+
+    encoder.trainable = False
+
+    quantizer.trainable = False
+
+    decoder.trainable = False
+
+    dummy_image = tf.zeros(
+        [1, *IMAGE_SIZE, 3],
+        dtype=tf.float32
+    )
+
+    dummy_latent = encoder(
+        dummy_image,
+        training=False
+    )
+
+    if isinstance(dummy_latent, (tuple, list)):
+        dummy_latent = dummy_latent[0]
+
+    print(
+        "Encoder output shape:",
+        dummy_latent.shape
+    )
+
+    codebook_embeddings = get_codebook_embeddings(
+        quantizer
+    )
+
+    print(
+        "Codebook embedding shape:",
+        codebook_embeddings.shape
+    )
+
+    if dummy_latent.shape[-1] != LATENT_CHANNELS:
+
+        raise ValueError(
+            f"Encoder produces {dummy_latent.shape[-1]} "
+            f"channels, but codebook dimension is "
+            f"{LATENT_CHANNELS}."
+        )
+
+    # --------------------------------------------------------
+    # 6. Precompute image tokens
+    # --------------------------------------------------------
+
+    print("\nPrecomputing VQ-VAE image tokens...")
+
+    token_map = precompute_image_tokens(
+        paths,
+        encoder,
+        codebook_embeddings
+    )
+
+    # --------------------------------------------------------
+    # 7. Create caption-image pairs
+    # --------------------------------------------------------
+
+    print("\nCreating training pairs...")
+
+    train_pairs = create_caption_pairs(
+        train_paths,
+        captions,
+        token_map
+    )
+
+    val_pairs = create_caption_pairs(
+        val_paths,
+        captions,
+        token_map
+    )
+
+    # --------------------------------------------------------
+    # 8. Create text vectorizer
+    # --------------------------------------------------------
+
+    print("\nCreating text vectorizer...")
+
+    vectorizer = create_text_vectorizer(
+        train_pairs
+    )
+
+    text_vocab_size = len(
+        vectorizer.get_vocabulary()
+    )
+
+    # --------------------------------------------------------
+    # 9. Build datasets WITHOUT SHUFFLING
+    # --------------------------------------------------------
+
+    print("\nBuilding training dataset...")
+
+    train_dataset = build_dataset(
+        train_pairs,
+        vectorizer,
+        training=True
+    )
+
+    print("\nBuilding validation dataset...")
+
+    val_dataset = build_dataset(
+        val_pairs,
+        vectorizer,
+        training=False
+    )
+
+    # --------------------------------------------------------
+    # 10. Create Transformer
+    # --------------------------------------------------------
+
+    print("\nCreating TextToImageTransformer...")
+
+    transformer = create_transformer(
+        text_vocab_size
+    )
+
+    print_model_information(
+        transformer,
+        encoder,
+        quantizer,
+        decoder
+    )
+
+    
+    from pathlib import Path
+
+    CHECKPOINT_PATH = Path(
+        "/kaggle/working/pixart_finetuned/text_to_image_transformer.weights.h5"
+    )
+    
+    if CHECKPOINT_PATH.is_file():
+    
+        print("\nLoading previously saved model weights...")
+    
+        transformer.load_weights(str(CHECKPOINT_PATH))
+    
+        print("Model weights loaded successfully.")
+    
+    else:
+        print("\nNo previous checkpoint found.")
+        print("Training will start with randomly initialized weights.")
+
+    # --------------------------------------------------------
+    # 11. Calculate training steps
+    # --------------------------------------------------------
+
+    steps_per_epoch = math.ceil(
+        len(train_pairs) / BATCH_SIZE
+    )
+
+    total_steps = (
+        steps_per_epoch * EPOCHS
+    )
+
+    print("\nTraining pairs:", len(train_pairs))
+
+    print("Validation pairs:", len(val_pairs))
+
+    print("Steps per epoch:", steps_per_epoch)
+
+    print("Total training steps:", total_steps)
+
+    # --------------------------------------------------------
+    # 12. Compile
+    # --------------------------------------------------------
+
+    print("\nCompiling Transformer...")
+
+    transformer = compile_transformer(
+        transformer,
+        total_steps
+    )
+
+    # --------------------------------------------------------
+    # 13. Train
+    # --------------------------------------------------------
+
+    callbacks = create_callbacks()
+
+    print("\nStarting text-to-image training...")
+
+    history = transformer.fit(
+
+        train_dataset,
+
+        validation_data=val_dataset,
+
+        epochs=EPOCHS,
+
+        callbacks=callbacks,
+
+        verbose=1
+    )
+
+    # --------------------------------------------------------
+    # 14. Save final model weights
+    # --------------------------------------------------------
+
+    final_checkpoint = (
+        OUTPUT_DIR /
+        "image_transformer_final.weights.h5"
+    )
+
+    transformer.save_weights(
+        str(final_checkpoint)
+    )
+
+    print(
+        "\nFinal weights saved:",
+        final_checkpoint
+    )
+
+    # --------------------------------------------------------
+    # 15. Save configuration and vocabulary
+    # --------------------------------------------------------
+
+    save_configuration(
+        vectorizer
+    )
+
+    # --------------------------------------------------------
+    # 16. Generate images
+    # --------------------------------------------------------
+
+    print("\nGenerating images from text...")
+
+    generate_images(
+        transformer=transformer,
+        vectorizer=vectorizer,
+        codebook_embeddings=codebook_embeddings,
+        decoder=decoder,
+        prompt="A dog running through a green field",
+        number_of_images=4,
+        temperature=1.0,
+        top_k=50
+    )
+
+    print("\n" + "=" * 65)
+
+    print("TEXT-TO-IMAGE TRAINING COMPLETED")
+
+    print("=" * 65)
+
+    return transformer, history
+
+
+# def main():
+
+
+#     # --------------------------------------------------------
+#     # 0. Initialize multi-GPU strategy
+#     # --------------------------------------------------------
+
+#     gpus = tf.config.list_physical_devices("GPU")
+
+#     print("\nAvailable GPUs:", len(gpus))
+
+#     if len(gpus) < 2:
+#         raise RuntimeError(
+#             f"Expected 2 GPUs, but found {len(gpus)}."
+#         )
+#     strategy = tf.distribute.MirroredStrategy(
+#         devices=["/GPU:0", "/GPU:1"]
+#     )
+
+#     print("Number of synchronized replicas:", strategy.num_replicas_in_sync)
+
+#     # Continue with your existing code...
+
+#     # --------------------------------------------------------
+#     # 1. Load first 15,000 unique images and captions
+#     # --------------------------------------------------------
+
+#     print("\nLoading Flickr30k captions...")
+
+#     # captions = load_captions(
+#     #     CAPTION_FILE
+#     # )
+
+#     # # --------------------------------------------------------
+#     # # 2. Load images in original CSV order
+#     # # --------------------------------------------------------
+
+#     # print("\nLoading image paths...")
+
+#     # paths = load_image_paths(
+#     #     captions
+#     # )
+
+#     # # --------------------------------------------------------
+#     # # 3. Verify mapping
+#     # # --------------------------------------------------------
+
+#     # total_captions = verify_image_caption_mapping(
+#     #     paths,
+#     #     captions
+#     # )
+
+#     # --------------------------------------------------------
+#     # 4. Split without shuffling
+#     # --------------------------------------------------------
+
+#     # train_paths, val_paths = split_image_paths(
+#     #     paths
+#     # )
+
+#     # print("\nFinal dataset statistics:")
+
+#     # print("Total images:", len(paths))
+
+#     # print("Total captions:", total_captions)
+
+#     # print("Training images:", len(train_paths))
+
+#     # print("Validation images:", len(val_paths))
+
+#     # --------------------------------------------------------
+#     # 5. Load pretrained VQ-VAE
+#     # --------------------------------------------------------
+
+#     print("\nLoading pretrained VQ-VAE...")
+
+#     encoder, quantizer, decoder = load_vqvae()
+
+#     encoder.trainable = False
+
+#     quantizer.trainable = False
+
+#     decoder.trainable = False
+
+#     dummy_image = tf.zeros(
+#         [1, *IMAGE_SIZE, 3],
+#         dtype=tf.float32
+#     )
+
+#     dummy_latent = encoder(
+#         dummy_image,
+#         training=False
+#     )
+
+#     if isinstance(dummy_latent, (tuple, list)):
+#         dummy_latent = dummy_latent[0]
+
+#     print(
+#         "Encoder output shape:",
+#         dummy_latent.shape
+#     )
+
+#     codebook_embeddings = get_codebook_embeddings(
+#         quantizer
+#     )
+
+#     print(
+#         "Codebook embedding shape:",
+#         codebook_embeddings.shape
+#     )
+
+#     if dummy_latent.shape[-1] != LATENT_CHANNELS:
+
+#         raise ValueError(
+#             f"Encoder produces {dummy_latent.shape[-1]} "
+#             f"channels, but codebook dimension is "
+#             f"{LATENT_CHANNELS}."
+#         )
+
+#     # --------------------------------------------------------
+#     # 6. Precompute image tokens
+#     # --------------------------------------------------------
+
+#     # print("\nPrecomputing VQ-VAE image tokens...")
+
+#     # token_map = precompute_image_tokens(
+#     #     paths,
+#     #     encoder,
+#     #     codebook_embeddings
+#     # )
+
+#     # --------------------------------------------------------
+#     # 7. Create caption-image pairs
+#     # --------------------------------------------------------
+
+#     # print("\nCreating training pairs...")
+
+#     # train_pairs = create_caption_pairs(
+#     #     train_paths,
+#     #     captions,
+#     #     token_map
+#     # )
+
+#     # val_pairs = create_caption_pairs(
+#     #     val_paths,
+#     #     captions,
+#     #     token_map
+#     # )
+
+#     # --------------------------------------------------------
+#     # 8. Create text vectorizer
+#     # --------------------------------------------------------
+
+#     # print("\nCreating text vectorizer...")
+
+#     vectorizer = create_text_vectorizer(
+#         train_pairs
+#     )
+
+#     text_vocab_size = len(
+#         vectorizer.get_vocabulary()
+#     )
+
+#     # --------------------------------------------------------
+#     # 9. Build datasets WITHOUT SHUFFLING
+#     # --------------------------------------------------------
+
+#     # print("\nBuilding training dataset...")
+
+#     # train_dataset = build_dataset(
+#     #     train_pairs,
+#     #     vectorizer,
+#     #     training=True
+#     # )
+
+#     # print("\nBuilding validation dataset...")
+
+#     # val_dataset = build_dataset(
+#     #     val_pairs,
+#     #     vectorizer,
+#     #     training=False
+#     # )
+
+#     # --------------------------------------------------------
+#     # 10. Create Transformer
+#     # --------------------------------------------------------
+
+#     print("\nCreating TextToImageTransformer...")
+
+#     transformer = create_transformer(
+#         text_vocab_size
+#     )
+
+#     print_model_information(
+#         transformer,
+#         encoder,
+#         quantizer,
+#         decoder
+#     )
+
+    
+#     from pathlib import Path
+
+#     CHECKPOINT_PATH = Path(
+#         "/kaggle/working/pixart_finetuned/text_to_image_transformer.weights.h5"
+#     )
+    
+#     if CHECKPOINT_PATH.is_file():
+    
+#         print("\nLoading previously saved model weights...")
+    
+#         transformer.load_weights(str(CHECKPOINT_PATH))
+    
+#         print("Model weights loaded successfully.")
+    
+#     else:
+#         print("\nNo previous checkpoint found.")
+#         print("Training will start with randomly initialized weights.")
+
+#     # --------------------------------------------------------
+#     # 11. Calculate training steps
+#     # --------------------------------------------------------
+
+#     steps_per_epoch = math.ceil(
+#         len(train_pairs) / BATCH_SIZE
+#     )
+
+#     total_steps = (
+#         steps_per_epoch * EPOCHS
+#     )
+
+#     print("\nTraining pairs:", len(train_pairs))
+
+#     print("Validation pairs:", len(val_pairs))
+
+#     print("Steps per epoch:", steps_per_epoch)
+
+#     print("Total training steps:", total_steps)
+
+#     # --------------------------------------------------------
+#     # 12. Compile
+#     # --------------------------------------------------------
+
+#     print("\nCompiling Transformer...")
+
+#     transformer = compile_transformer(
+#         transformer,
+#         total_steps
+#     )
+
+#     # --------------------------------------------------------
+#     # 13. Train
+#     # --------------------------------------------------------
+
+#     callbacks = create_callbacks()
+
+#     print("\nStarting text-to-image training...")
+
+#     history = transformer.fit(
+
+#         train_dataset,
+
+#         validation_data=val_dataset,
+
+#         epochs=EPOCHS,
+
+#         callbacks=callbacks,
+
+#         verbose=1
+#     )
+
+#     # --------------------------------------------------------
+#     # 14. Save final model weights
+#     # --------------------------------------------------------
+
+#     # final_checkpoint = (
+#     #     OUTPUT_DIR /
+#     #     "image_transformer_final.weights.h5"
+#     # )
+
+#     # transformer.save_weights(
+#     #     str(final_checkpoint)
+#     # )
+
+#     print(
+#         "\nFinal weights saved:",
+#         final_checkpoint
+#     )
+
+#     # --------------------------------------------------------
+#     # 15. Save configuration and vocabulary
+#     # --------------------------------------------------------
+
+#     # save_configuration(
+#     #     vectorizer
+#     # )
+
+#     # --------------------------------------------------------
+#     # 16. Generate images
+#     # --------------------------------------------------------
+
+#     print("\nGenerating images from text...")
+
+#     generate_images(
+#         transformer=transformer,
+#         vectorizer=vectorizer,
+#         codebook_embeddings=codebook_embeddings,
+#         decoder=decoder,
+#         prompt="A dog running through a green field",
+#         number_of_images=4,
+#         temperature=1.0,
+#         top_k=50
+#     )
+
+#     print("\n" + "=" * 65)
+
+#     print("TEXT-TO-IMAGE TRAINING COMPLETED")
+
+#     print("=" * 65)
+
+#     return transformer, history
+
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
+if __name__ == "__main__":
+
+    transformer, history = main()
+
