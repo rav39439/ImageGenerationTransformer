@@ -70,6 +70,240 @@ def load_vqvae(model_dir=DEFAULT_MODEL_DIR):
     return encoder, quantizer, decoder
 
 
+#------------working----------------
+
+import os
+import numpy as np
+import tensorflow as tf
+import h5py
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+MODEL_DIR = "/kaggle/input/datasets/ravckumar/encoder-decoder-30k"
+
+ENCODER_PATH = os.path.join(
+    MODEL_DIR, "encoder_epoch.weights.h5"
+)
+
+DECODER_PATH = os.path.join(
+    MODEL_DIR, "decoder_epoch.weights.h5"
+)
+
+VQ_PATH = os.path.join(
+    MODEL_DIR, "vector_quantizer.weights.h5"
+)
+
+VQ_NPY_PATH = os.path.join(
+    MODEL_DIR, "vq_epoch.npy"
+)
+
+# =====================================================
+# 1. CHECK FILES
+# =====================================================
+
+for path in [
+    ENCODER_PATH,
+    DECODER_PATH,
+    VQ_PATH,
+    VQ_NPY_PATH
+]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+print("All checkpoint files found.")
+
+# =====================================================
+# 2. LOAD CODEBOOK
+# =====================================================
+
+vq_data = np.load(
+    VQ_NPY_PATH,
+    allow_pickle=True
+)
+
+if vq_data.size != 1:
+    raise ValueError(
+        f"Unexpected VQ array size: {vq_data.size}"
+    )
+
+codebook = np.asarray(
+    vq_data[0],
+    dtype=np.float32
+)
+
+if codebook.shape != (1024, 256):
+    raise ValueError(
+        f"Invalid codebook shape: {codebook.shape}"
+    )
+
+if not np.isfinite(codebook).all():
+    raise ValueError("Codebook contains NaN or Inf.")
+
+print("\nCodebook loaded successfully.")
+print("Shape:", codebook.shape)
+
+# =====================================================
+# 3. INSPECT H5 WEIGHTS
+# =====================================================
+
+def inspect_weights(path):
+
+    print("\n" + "=" * 60)
+    print(os.path.basename(path))
+    print("=" * 60)
+
+    with h5py.File(path, "r") as f:
+
+        def visitor(name, obj):
+
+            if isinstance(obj, h5py.Dataset):
+
+                print(
+                    name,
+                    "| Shape:", obj.shape,
+                    "| Dtype:", obj.dtype
+                )
+
+        f.visititems(visitor)
+
+
+inspect_weights(ENCODER_PATH)
+inspect_weights(DECODER_PATH)
+inspect_weights(VQ_PATH)
+
+# =====================================================
+# 4. CODEBOOK STATISTICS
+# =====================================================
+
+print("\nCODEBOOK STATISTICS")
+
+print("Minimum:", np.min(codebook))
+print("Maximum:", np.max(codebook))
+print("Mean:", np.mean(codebook))
+print("Standard deviation:", np.std(codebook))
+
+print("\nCheckpoint inspection completed.")
+
+
+#----------------vqvae_load-----------------
+
+import os
+import numpy as np
+import tensorflow as tf
+
+MODEL_DIR = "/kaggle/input/datasets/ravckumar/encoder-decoder-30k"
+
+
+def load_vqvae(model_dir=MODEL_DIR):
+
+    # -------------------------------------------------
+    # 1. Instantiate your existing architectures
+    # -------------------------------------------------
+
+    enc = get_encoder()
+    vq = VectorQuantizer(
+        num_embeddings=1024,
+        embedding_dim=256
+    )
+    dec = get_decoder()
+
+    # -------------------------------------------------
+    # 2. Build models before loading weights
+    # -------------------------------------------------
+
+    dummy_input = tf.zeros((1, 224, 224, 3))
+
+    z = enc(dummy_input)
+
+    quantized = vq(z)
+
+    reconstructed = dec(quantized)
+
+    print("Encoder output:", z.shape)
+    print("Quantizer output:", quantized.shape)
+    print("Decoder output:", reconstructed.shape)
+
+    # -------------------------------------------------
+    # 3. Load encoder weights
+    # -------------------------------------------------
+
+    encoder_path = os.path.join(
+        model_dir,
+        "encoder_epoch.weights.h5"
+    )
+
+    enc.load_weights(encoder_path)
+
+    print("Encoder weights loaded!")
+
+    # -------------------------------------------------
+    # 4. Load decoder weights
+    # -------------------------------------------------
+
+    decoder_path = os.path.join(
+        model_dir,
+        "decoder_epoch.weights.h5"
+    )
+
+    dec.load_weights(decoder_path)
+
+    print("Decoder weights loaded!")
+
+    # -------------------------------------------------
+    # 5. Load actual VQ codebook
+    # -------------------------------------------------
+
+    vq_path = os.path.join(
+        model_dir,
+        "vq_epoch.npy"
+    )
+
+    vq_data = np.load(vq_path, allow_pickle=True)
+
+    vq_weights = np.asarray(
+        vq_data[0],
+        dtype=np.float32
+    )
+
+    expected_shape = (1024, 256)
+
+    if vq_weights.shape != expected_shape:
+        raise ValueError(
+            f"Expected {expected_shape}, "
+            f"received {vq_weights.shape}"
+        )
+
+    # Assign codebook
+    vq.embeddings.assign(vq_weights)
+
+    print("VQ codebook loaded:", vq_weights.shape)
+
+    return enc, vq, dec
+
+
+# -------------------------------------------------
+# 6. Test
+# -------------------------------------------------
+
+if __name__ == "__main__":
+
+    enc, vq, dec = load_vqvae()
+
+    sample = tf.zeros(
+        (1, 224, 224, 3),
+        dtype=tf.float32
+    )
+
+    z = enc(sample)
+    quantized = vq(z)
+    reconstructed = dec(quantized)
+
+    print("\nInference test successful!")
+    print("Encoder:", z.shape)
+    print("Quantized:", quantized.shape)
+    print("Decoder:", reconstructed.shape)
+
 if __name__ == "__main__":
     enc, vq, dec = load_vqvae()
     sample = tf.zeros((1, 224, 224, 3), dtype=tf.float32)
