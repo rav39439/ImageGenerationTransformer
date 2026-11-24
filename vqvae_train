@@ -236,3 +236,835 @@ dummy_latents = tf.random.normal((1, 56, 56, latent_dim))
 _ = decoder_new(dummy_latents)
 decoder_new.load_weights(decoder_weights_path)
 print("VectorQuantizer weights loaded successfully!")
+
+
+
+#------------------vqvae_trainer-optimized ----------------------------------------------
+# ============================================================
+# VQ-VAE TRAINING USING TWO GPUS
+# 30,000 FLICKR30K IMAGES
+# MEMORY-EFFICIENT STREAMING DATA PIPELINE
+# ============================================================
+
+import os
+import math
+import numpy as np
+import tensorflow as tf
+
+from pathlib import Path
+from tensorflow import keras
+from tensorflow.keras import layers
+
+
+# Import your existing VQ-VAE implementation.
+# If VQVAETrainer is already defined in this notebook,
+# you can remove this import.
+
+class DistributedVQVAETrainer(VQVAETrainer):
+
+    def call(self, inputs, training=False):
+
+        return self.vqvae(
+            inputs,
+            training=training
+        )
+
+
+# ============================================================
+# 0. CONFIGURATION
+# ============================================================
+
+DATASET_ROOT = (
+    "/kaggle/input/datasets/hsankesara/"
+    "flickr-image-dataset/flickr30k_images"
+)
+
+IMAGE_ROOT = os.path.join(
+    DATASET_ROOT,
+    "flickr30k_images"
+)
+
+IMAGE_SIZE = (224, 224)
+
+MAX_IMAGES = 30000
+
+latent_dim = 256
+
+num_embeddings = 1024
+
+# Global batch size across both GPUs.
+GLOBAL_BATCH_SIZE = 16
+
+# Each GPU receives 8 images per step.
+PARALLEL_MAP_CALLS = 2
+
+SHUFFLE_BUFFER = 1024
+
+PREFETCH_BATCHES = 1
+
+EPOCHS_TO_RUN = 2
+
+# Change this if your existing checkpoint represents
+# an epoch other than epoch 4.
+INITIAL_CHECKPOINT_EPOCH = 4
+
+RANDOM_SEED = 42
+
+tf.keras.utils.set_random_seed(RANDOM_SEED)
+
+
+# ============================================================
+# 1. CHECKPOINT PATHS
+# ============================================================
+
+WORK_DIR = Path(
+    "/kaggle/working"
+)
+
+WORK_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+ENCODER_PATH = (
+    WORK_DIR / "encoder_epoch.weights.h5"
+)
+
+VQ_PATH = (
+    WORK_DIR / "vq_epoch.npy"
+)
+
+DECODER_PATH = (
+    WORK_DIR / "decoder_epoch.weights.h5"
+)
+
+VQ_MODEL_PATH = (
+    WORK_DIR / "vector_quantizer.weights.h5"
+)
+
+FINAL_DECODER_PATH = (
+    WORK_DIR / "decoder.weights.h5"
+)
+
+
+# ============================================================
+# 2. INITIALIZE BOTH GPUS
+# ============================================================
+
+gpus = tf.config.list_physical_devices("GPU")
+
+print("\nAvailable GPUs:", len(gpus))
+
+if len(gpus) < 2:
+
+    raise RuntimeError(
+        f"Expected 2 GPUs, but found {len(gpus)}."
+    )
+
+# Enable memory growth before model initialization.
+
+for gpu in gpus[:2]:
+
+    try:
+
+        tf.config.experimental.set_memory_growth(
+            gpu,
+            True
+        )
+
+    except RuntimeError as error:
+
+        print(
+            "GPU memory configuration:",
+            error
+        )
+
+# Use exactly two GPUs.
+
+strategy = tf.distribute.MirroredStrategy(
+    devices=[
+        "/GPU:0",
+        "/GPU:1"
+    ]
+)
+
+print(
+    "\nNumber of synchronized replicas:",
+    strategy.num_replicas_in_sync
+)
+
+print(
+    "Global batch size:",
+    GLOBAL_BATCH_SIZE
+)
+
+print(
+    "Per-GPU batch size:",
+    GLOBAL_BATCH_SIZE // strategy.num_replicas_in_sync
+)
+
+if GLOBAL_BATCH_SIZE % strategy.num_replicas_in_sync != 0:
+
+    raise ValueError(
+        "Global batch size must be divisible "
+        "by the number of GPUs."
+    )
+
+
+# ============================================================
+# 3. COLLECT IMAGE PATHS
+# ============================================================
+
+print("\nCollecting Flickr30k image paths...")
+
+if not os.path.isdir(IMAGE_ROOT):
+
+    raise FileNotFoundError(
+        f"Image directory not found: {IMAGE_ROOT}"
+    )
+
+VALID_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png"
+)
+
+image_files = sorted([
+
+    filename
+
+    for filename in os.listdir(IMAGE_ROOT)
+
+    if filename.lower().endswith(VALID_EXTENSIONS)
+
+])
+
+image_files = image_files[:MAX_IMAGES]
+
+image_paths = [
+
+    os.path.join(
+        IMAGE_ROOT,
+        filename
+    )
+
+    for filename in image_files
+
+    if os.path.isfile(
+        os.path.join(IMAGE_ROOT, filename)
+    )
+
+]
+
+if not image_paths:
+
+    raise RuntimeError(
+        "No valid image paths were found."
+    )
+
+print(
+    "\nTotal image paths:",
+    len(image_paths)
+)
+
+print(
+    "First image:",
+    image_paths[0]
+)
+
+
+# ============================================================
+# 4. IMAGE PREPROCESSING
+# ============================================================
+
+def preprocess_image(image_path):
+
+    # Read one image from disk.
+
+    image_bytes = tf.io.read_file(
+        image_path
+    )
+
+    # Decode image.
+
+    image_tensor = tf.io.decode_image(
+        image_bytes,
+        channels=3,
+        expand_animations=False
+    )
+
+    image_tensor.set_shape(
+        [None, None, 3]
+    )
+
+    # Normalize uint8 [0,255] into float32 [0,1].
+
+    image_tensor = tf.image.convert_image_dtype(
+        image_tensor,
+        tf.float32
+    )
+
+    # Resize to 224 x 224.
+
+    image_tensor = tf.image.resize(
+        image_tensor,
+        IMAGE_SIZE
+    )
+
+    image_tensor = tf.ensure_shape(
+        image_tensor,
+        [
+            IMAGE_SIZE[0],
+            IMAGE_SIZE[1],
+            3
+        ]
+    )
+
+    return image_tensor
+
+
+# ============================================================
+# 5. CREATE STREAMING DATASET
+# ============================================================
+
+def create_image_dataset(
+    paths,
+    training=True
+):
+
+    dataset = tf.data.Dataset.from_tensor_slices(
+        paths
+    )
+
+    # Shuffle paths, not decoded image tensors.
+
+    if training:
+
+        dataset = dataset.shuffle(
+            buffer_size=min(
+                len(paths),
+                SHUFFLE_BUFFER
+            ),
+            seed=RANDOM_SEED,
+            reshuffle_each_iteration=True
+        )
+
+    # Load images lazily.
+
+    dataset = dataset.map(
+        preprocess_image,
+        num_parallel_calls=PARALLEL_MAP_CALLS,
+        deterministic=not training
+    )
+
+    # Batch before distribution across GPUs.
+
+    dataset = dataset.batch(
+        GLOBAL_BATCH_SIZE,
+        drop_remainder=True
+    )
+
+    # Limit CPU memory occupied by queued batches.
+
+    dataset = dataset.prefetch(
+        PREFETCH_BATCHES
+    )
+
+    # Limit private CPU thread usage.
+
+    options = tf.data.Options()
+
+    options.threading.private_threadpool_size = 4
+
+    options.threading.max_intra_op_parallelism = 1
+
+    dataset = dataset.with_options(
+        options
+    )
+
+    return dataset
+
+
+print("\nCreating streaming image dataset...")
+
+train_dataset = create_image_dataset(
+    image_paths,
+    training=True
+)
+
+steps_per_epoch = (
+    len(image_paths) // GLOBAL_BATCH_SIZE
+)
+
+if steps_per_epoch == 0:
+
+    raise RuntimeError(
+        "Not enough images for the selected batch size."
+    )
+
+print("\nDataset created successfully.")
+
+print(
+    "Total images:",
+    len(image_paths)
+)
+
+print(
+    "Global batch size:",
+    GLOBAL_BATCH_SIZE
+)
+
+print(
+    "Images per GPU:",
+    GLOBAL_BATCH_SIZE // strategy.num_replicas_in_sync
+)
+
+print(
+    "Steps per epoch:",
+    steps_per_epoch
+)
+
+print(
+    "Images used per epoch:",
+    steps_per_epoch * GLOBAL_BATCH_SIZE
+)
+
+print(
+    "Images dropped:",
+    len(image_paths) -
+    steps_per_epoch * GLOBAL_BATCH_SIZE
+)
+
+
+# ============================================================
+# 6. CHECKPOINT SAVING CALLBACK
+# ============================================================
+
+class SaveVQVAEWeights(
+    keras.callbacks.Callback
+):
+
+    def on_epoch_end(
+        self,
+        epoch,
+        logs=None
+    ):
+
+        epoch_number = epoch + 1
+
+        print(
+            f"\nSaving VQ-VAE weights after epoch {epoch_number}..."
+        )
+
+        # ----------------------------------------------------
+        # Save encoder
+        # ----------------------------------------------------
+
+        self.model.encoder.save_weights(
+            str(ENCODER_PATH)
+        )
+
+        # ----------------------------------------------------
+        # Save vector quantizer
+        # ----------------------------------------------------
+
+        vq_weights = (
+            self.model.vq_layer.get_weights()
+        )
+
+        # Store arrays in a 1D object array so that
+        # different weight shapes are preserved.
+
+        weight_container = np.empty(
+            len(vq_weights),
+            dtype=object
+        )
+
+        for index, weight in enumerate(vq_weights):
+
+            weight_container[index] = weight
+
+        np.save(
+            str(VQ_PATH),
+            weight_container,
+            allow_pickle=True
+        )
+
+        # ----------------------------------------------------
+        # Save decoder
+        # ----------------------------------------------------
+
+        self.model.decoder.save_weights(
+            str(DECODER_PATH)
+        )
+
+        print(
+            f"\nSaved all VQ-VAE weights for epoch {epoch_number}."
+        )
+
+
+# ============================================================
+# 7. CHECK EXISTING CHECKPOINTS
+# ============================================================
+
+print("\nChecking previous VQ-VAE checkpoints...")
+
+checkpoint_files = [
+
+    ENCODER_PATH,
+
+    VQ_PATH,
+
+    DECODER_PATH
+
+]
+
+checkpoint_exists = [
+
+    path.is_file()
+
+    for path in checkpoint_files
+
+]
+
+if any(checkpoint_exists) and not all(checkpoint_exists):
+
+    missing_files = [
+
+        str(path)
+
+        for path, exists in zip(
+            checkpoint_files,
+            checkpoint_exists
+        )
+
+        if not exists
+
+    ]
+
+    raise FileNotFoundError(
+        "Incomplete VQ-VAE checkpoint. Missing files:\n"
+        + "\n".join(missing_files)
+    )
+
+RESTORE_CHECKPOINT = all(
+    checkpoint_exists
+)
+
+if RESTORE_CHECKPOINT:
+
+    print("\nPrevious VQ-VAE weights found.")
+
+else:
+
+    print("\nNo previous VQ-VAE weights found.")
+
+
+# ============================================================
+# 8. CREATE VQ-VAE INSIDE DISTRIBUTION SCOPE
+# ============================================================
+
+print("\nCreating VQ-VAE model...")
+
+with strategy.scope():
+
+    vqvae_trainer = DistributedVQVAETrainer(
+        latent_dim=latent_dim,
+        num_embeddings=num_embeddings
+    )
+
+    dummy_input = tf.zeros(
+        (1, 224, 224, 3),
+        dtype=tf.float32
+    )
+
+    # Build the OUTER trainer model.
+    _ = vqvae_trainer(
+        dummy_input,
+        training=False
+    )
+
+    print("VQVAETrainer built successfully.")
+
+    # --------------------------------------------------------
+    # 9. RESTORE ENCODER, QUANTIZER AND DECODER
+    # --------------------------------------------------------
+
+    if RESTORE_CHECKPOINT:
+
+        print("\nRestoring pretrained VQ-VAE weights...")
+
+        # Restore encoder.
+
+        vqvae_trainer.encoder.load_weights(
+            str(ENCODER_PATH)
+        )
+
+        print("Encoder weights restored.")
+
+        # Restore vector quantizer.
+
+        loaded_vq_weights = np.load(
+            str(VQ_PATH),
+            allow_pickle=True
+        )
+
+        vq_weights = [
+
+            np.asarray(weight)
+
+            for weight in loaded_vq_weights
+
+        ]
+
+        vqvae_trainer.vq_layer.set_weights(
+            vq_weights
+        )
+
+        print("Vector quantizer weights restored.")
+
+        # Restore decoder.
+
+        vqvae_trainer.decoder.load_weights(
+            str(DECODER_PATH)
+        )
+
+        print("Decoder weights restored.")
+
+        initial_epoch = INITIAL_CHECKPOINT_EPOCH
+
+        print(
+            "\nResuming from epoch:",
+            initial_epoch
+        )
+
+    else:
+
+        print(
+            "\nStarting with randomly initialized VQ-VAE weights."
+        )
+
+        initial_epoch = 0
+
+    # --------------------------------------------------------
+    # 10. COMPILE VQ-VAE
+    # --------------------------------------------------------
+
+    print("\nCompiling VQ-VAE...")
+
+    vqvae_trainer.compile(
+
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=1e-3
+        )
+
+    )
+
+print("\nVQ-VAE ready for distributed training.")
+
+
+# ============================================================
+# 11. TRAIN USING BOTH GPUS
+# ============================================================
+
+callbacks = [
+
+    SaveVQVAEWeights()
+
+]
+
+total_epochs = (
+    initial_epoch + EPOCHS_TO_RUN
+)
+
+print("\n" + "=" * 65)
+
+print("STARTING TWO-GPU VQ-VAE TRAINING")
+
+print("=" * 65)
+
+print(
+    "GPUs:",
+    strategy.num_replicas_in_sync
+)
+
+print(
+    "Starting epoch:",
+    initial_epoch
+)
+
+print(
+    "Final epoch:",
+    total_epochs
+)
+
+print(
+    "Training images:",
+    len(image_paths)
+)
+
+print(
+    "Global batch size:",
+    GLOBAL_BATCH_SIZE
+)
+
+print(
+    "Steps per epoch:",
+    steps_per_epoch
+)
+
+# Important:
+# The dataset is already batched.
+# Do not pass batch_size again.
+
+history = vqvae_trainer.fit(
+
+    train_dataset,
+
+    epochs=total_epochs,
+
+    initial_epoch=initial_epoch,
+
+    callbacks=callbacks,
+
+    verbose=1
+
+)
+
+
+# ============================================================
+# 12. GET TRAINED COMPONENTS
+# ============================================================
+
+print("\nRetrieving trained VQ-VAE components...")
+
+encoder = vqvae_trainer.encoder
+
+vq_layer = vqvae_trainer.vq_layer
+
+decoder = vqvae_trainer.decoder
+
+
+# ============================================================
+# 13. SAVE FINAL COMPONENT WEIGHTS
+# ============================================================
+
+print("\nSaving final VQ-VAE weights...")
+
+# Save encoder.
+
+encoder.save_weights(
+    str(ENCODER_PATH)
+)
+
+# Save quantizer as NumPy weights.
+
+vq_weights = vq_layer.get_weights()
+
+weight_container = np.empty(
+    len(vq_weights),
+    dtype=object
+)
+
+for index, weight in enumerate(vq_weights):
+
+    weight_container[index] = weight
+
+np.save(
+    str(VQ_PATH),
+    weight_container,
+    allow_pickle=True
+)
+
+# Save decoder.
+
+decoder.save_weights(
+    str(DECODER_PATH)
+)
+
+print("\nFinal encoder weights saved.")
+
+print("Final quantizer weights saved.")
+
+print("Final decoder weights saved.")
+
+
+# ============================================================
+# 14. CREATE STANDALONE VECTOR QUANTIZER MODEL
+# ============================================================
+
+print("\nCreating standalone vector quantizer model...")
+
+vq_inputs = keras.Input(
+    shape=(56, 56, latent_dim)
+)
+
+vq_outputs = vq_layer(
+    vq_inputs,
+    return_indices=False
+)
+
+vq_model = keras.Model(
+
+    inputs=vq_inputs,
+
+    outputs=vq_outputs,
+
+    name="vector_quantizer_model"
+
+)
+
+# Save standalone quantizer weights.
+
+vq_model.save_weights(
+    str(VQ_MODEL_PATH)
+)
+
+print(
+    "\nVector quantizer model saved:",
+    VQ_MODEL_PATH
+)
+
+
+# ============================================================
+# 15. SAVE STANDALONE DECODER WEIGHTS
+# ============================================================
+
+decoder.save_weights(
+    str(FINAL_DECODER_PATH)
+)
+
+print(
+    "\nDecoder weights saved:",
+    FINAL_DECODER_PATH
+)
+
+
+# ============================================================
+# 16. FINAL STATUS
+# ============================================================
+
+print("\n" + "=" * 65)
+
+print("VQ-VAE TRAINING COMPLETED SUCCESSFULLY")
+
+print("=" * 65)
+
+print("\nSaved files:")
+
+print("Encoder:", ENCODER_PATH)
+
+print("Quantizer:", VQ_PATH)
+
+print("Decoder:", DECODER_PATH)
+
+print("Standalone quantizer:", VQ_MODEL_PATH)
+
+print("Standalone decoder:", FINAL_DECODER_PATH)
+
+print("\nTraining history:")
+
+print(history.history)
+
+print("\nVQ-VAE training pipeline completed.")
+
